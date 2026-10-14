@@ -1,0 +1,4 @@
+/build/
+sdkconfig.old
+.DS_Store
+__pycache__/
