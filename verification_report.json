@@ -1,0 +1,8 @@
+{
+  "forward_checks": 250,
+  "max_absolute_logit_error": 2.193450927734375e-05,
+  "tolerance": "atol=2e-4, rtol=2e-4",
+  "tokenizer": "all 65 IDs round-trip",
+  "sampling": "greedy, top-k bounds, categorical CDF, input unchanged",
+  "scope": "Actual portable C firmware math on host; no hardware execution"
+}

@@ -1,263 +1,206 @@
-"""
-train_micro_gpt.py - Train a Micro-Transformer and export weights for ESP32-C3
-
-Usage:
-    pip install torch
-    python train_micro_gpt.py [--epochs 500] [--data your_text.txt]
-"""
-
-import os
-import sys
-import math
+"""Train, evaluate and export the character transformer for ESP32-S3."""
 import argparse
-import urllib.request
+import hashlib
+import json
+import math
+from pathlib import Path
+import random
+import re
+import time
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
 
-try:
-    import torch
-    import torch.nn as nn
-    from torch.nn import functional as F
-except ImportError:
-    print("=" * 60)
-    print("PyTorch is required for training.")
-    print("Please install PyTorch: pip install torch")
-    print("=" * 60)
-    sys.exit(1)
-
-# Hyperparameters matching ESP32 firmware
 VOCABULARY = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-VOCAB_SIZE = len(VOCABULARY)
-BLOCK_SIZE = 32
-N_EMBD = 32
-N_HEAD = 2
-N_LAYER = 1
-HEAD_DIM = N_EMBD // N_HEAD
 
-char_to_id = {ch: i for i, ch in enumerate(VOCABULARY)}
-id_to_char = {i: ch for i, ch in enumerate(VOCABULARY)}
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self):
+class Attention(nn.Module):
+    def __init__(self, width, heads, context, dropout):
         super().__init__()
-        self.c_attn = nn.Linear(N_EMBD, 3 * N_EMBD)
-        self.c_proj = nn.Linear(N_EMBD, N_EMBD)
-        self.register_buffer("bias", torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE))
-                                     .view(1, 1, BLOCK_SIZE, BLOCK_SIZE))
-
+        self.heads = heads
+        self.c_attn = nn.Linear(width, 3 * width)
+        self.c_proj = nn.Linear(width, width)
+        self.dropout = dropout
     def forward(self, x):
-        B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(N_EMBD, dim=2)
-        k = k.view(B, T, N_HEAD, HEAD_DIM).transpose(1, 2)
-        q = q.view(B, T, N_HEAD, HEAD_DIM).transpose(1, 2)
-        v = v.view(B, T, N_HEAD, HEAD_DIM).transpose(1, 2)
-
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(HEAD_DIM))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(y)
+        b, t, c = x.shape
+        q, k, v = self.c_attn(x).chunk(3, dim=-1)
+        q, k, v = [a.view(b, t, self.heads, c // self.heads).transpose(1, 2) for a in (q, k, v)]
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+            dropout_p=self.dropout if self.training else 0.0)
+        return self.c_proj(y.transpose(1, 2).contiguous().view(b, t, c))
 
 class MLP(nn.Module):
-    def __init__(self):
+    def __init__(self, width):
         super().__init__()
-        self.c_fc = nn.Linear(N_EMBD, 4 * N_EMBD)
-        self.c_proj = nn.Linear(4 * N_EMBD, N_EMBD)
-
+        self.c_fc = nn.Linear(width, 4 * width)
+        self.c_proj = nn.Linear(4 * width, width)
     def forward(self, x):
-        return self.c_proj(F.gelu(self.c_fc(x)))
+        return self.c_proj(F.gelu(self.c_fc(x), approximate="tanh"))
 
 class Block(nn.Module):
-    def __init__(self):
+    def __init__(self, width, heads, context, dropout):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(N_EMBD)
-        self.attn = CausalSelfAttention()
-        self.ln_2 = nn.LayerNorm(N_EMBD)
-        self.mlp = MLP()
-
+        self.ln_1 = nn.LayerNorm(width)
+        self.attn = Attention(width, heads, context, dropout)
+        self.ln_2 = nn.LayerNorm(width)
+        self.mlp = MLP(width)
+        self.drop = nn.Dropout(dropout)
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        x = x + self.drop(self.attn(self.ln_1(x)))
+        return x + self.drop(self.mlp(self.ln_2(x)))
 
 class MicroGPT(nn.Module):
-    def __init__(self):
+    def __init__(self, width=64, heads=2, context=64, layers=2, dropout=0.1):
         super().__init__()
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(VOCAB_SIZE, N_EMBD),
-            wpe = nn.Embedding(BLOCK_SIZE, N_EMBD),
-            h = nn.ModuleList([Block() for _ in range(N_LAYER)]),
-            ln_f = nn.LayerNorm(N_EMBD),
-        ))
-        self.lm_head = nn.Linear(N_EMBD, VOCAB_SIZE)
-
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = tok_emb + pos_emb
+        self.config = dict(width=width, heads=heads, context=context, layers=layers, dropout=dropout)
+        self.transformer = nn.ModuleDict(dict(wte=nn.Embedding(65, width),
+            wpe=nn.Embedding(context, width),
+            h=nn.ModuleList([Block(width, heads, context, dropout) for _ in range(layers)]),
+            ln_f=nn.LayerNorm(width)))
+        self.lm_head = nn.Linear(width, 65)
+        self.apply(self.initialize)
+    @staticmethod
+    def initialize(module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, std=0.02)
+            if isinstance(module, nn.Linear):
+                nn.init.zeros_(module.bias)
+    def forward(self, ids):
+        x = self.transformer.wte(ids) + self.transformer.wpe(torch.arange(ids.shape[1], device=ids.device))
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
+        return self.lm_head(self.transformer.ln_f(x))
 
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+# Shared mapping also makes the older exported model measurable without retraining it.
+LAYER_TENSORS = dict(ln1_gamma="ln_1.weight", ln1_beta="ln_1.bias",
+    qkv_weight="attn.c_attn.weight", qkv_bias="attn.c_attn.bias",
+    proj_weight="attn.c_proj.weight", proj_bias="attn.c_proj.bias",
+    ln2_gamma="ln_2.weight", ln2_beta="ln_2.bias", fc1_weight="mlp.c_fc.weight",
+    fc1_bias="mlp.c_fc.bias", fc2_weight="mlp.c_proj.weight", fc2_bias="mlp.c_proj.bias")
+OTHER_TENSORS = dict(wte_weight="transformer.wte.weight", wpe_weight="transformer.wpe.weight",
+    ln_f_gamma="transformer.ln_f.weight", ln_f_beta="transformer.ln_f.bias",
+    lm_head_weight="lm_head.weight", lm_head_bias="lm_head.bias")
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=0.7):
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= BLOCK_SIZE else idx[:, -BLOCK_SIZE:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-def export_to_c_header(model, out_path="main/model_weights.h"):
+def load_old_header(path):
+    model = MicroGPT(width=32, context=32, layers=1, dropout=0)
     state = model.state_dict()
-    
-    def fmt_1d(arr, name):
-        vals = arr.detach().cpu().numpy().flatten()
-        lines = [f"const float {name}[{len(vals)}] = {{"]
-        for i in range(0, len(vals), 8):
-            chunk = ", ".join(f"{v:9.6f}f" for v in vals[i:i+8])
-            comma = "," if i + 8 < len(vals) else ""
-            lines.append(f"    {chunk}{comma}")
-        lines.append("};\n")
-        return "\n".join(lines)
+    source = Path(path).read_text()
+    mapping = dict(OTHER_TENSORS)
+    mapping.update({"layer0_" + name: "transformer.h.0." + key for name, key in LAYER_TENSORS.items()})
+    for name, key in mapping.items():
+        body = re.search(r"const float " + name + r"\[\d+\]\s*=\s*\{(.*?)\};", source, re.S)[1]
+        body = re.sub(r"//[^\n]*", "", body)
+        values = [float(x.strip().rstrip('f')) for x in body.split(',') if x.strip()]
+        state[key] = torch.tensor(values).reshape(state[key].shape)
+    model.load_state_dict(state)
+    return model.eval()
 
-    def fmt_2d(arr, name):
-        mat = arr.detach().cpu().numpy()
-        flat = mat.flatten()
-        lines = [f"const float {name}[{len(flat)}] = {{ // shape {list(mat.shape)}"]
-        for i in range(0, len(flat), 8):
-            chunk = ", ".join(f"{v:9.6f}f" for v in flat[i:i+8])
-            comma = "," if i + 8 < len(flat) else ""
-            lines.append(f"    {chunk}{comma}")
-        lines.append("};\n")
-        return "\n".join(lines)
+@torch.no_grad()
+def evaluate(model, data, device, starts, batch_size=32):
+    """Score identical next-character targets, using each model's context length."""
+    model.eval()
+    context = model.config['context']
+    total = 0.0
+    for off in range(0, len(starts), batch_size):
+        positions = starts[off:off+batch_size]
+        x = torch.stack([data[p-context:p] for p in positions]).to(device)
+        y = data[positions].to(device)
+        total += F.cross_entropy(model(x)[:, -1], y, reduction='sum').item()
+    return total / len(starts)
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("#ifndef MODEL_WEIGHTS_H\n#define MODEL_WEIGHTS_H\n\n")
-        f.write("// Trained Micro-Transformer weights exported from PyTorch\n")
-        f.write("#ifndef VOCAB_SIZE\n")
-        f.write(f"#define VOCAB_SIZE {VOCAB_SIZE}\n")
-        f.write("#endif\n")
-        f.write("#ifndef BLOCK_SIZE\n")
-        f.write(f"#define BLOCK_SIZE {BLOCK_SIZE}\n")
-        f.write("#endif\n")
-        f.write("#ifndef N_EMBD\n")
-        f.write(f"#define N_EMBD     {N_EMBD}\n")
-        f.write("#endif\n")
-        f.write("#ifndef N_HEAD\n")
-        f.write(f"#define N_HEAD     {N_HEAD}\n")
-        f.write("#endif\n")
-        f.write("#ifndef N_LAYER\n")
-        f.write(f"#define N_LAYER    {N_LAYER}\n")
-        f.write("#endif\n\n")
+@torch.no_grad()
+def sample(model, prompt, count=160, temperature=0.8, top_k=20):
+    device = next(model.parameters()).device
+    ids = [VOCABULARY.index(c) for c in prompt]
+    for _ in range(count):
+        x = torch.tensor([ids[-model.config['context']:]], device=device)
+        logits = model(x)[0, -1] / temperature
+        cutoff = logits.topk(top_k).values[-1]
+        logits[logits < cutoff] = float('-inf')
+        ids.append(torch.multinomial(logits.softmax(-1), 1).item())
+    return ''.join(VOCABULARY[i] for i in ids)
 
-        f.write(fmt_2d(state["transformer.wte.weight"], "wte_weight"))
-        f.write(fmt_2d(state["transformer.wpe.weight"], "wpe_weight"))
-
-        # Layer 0
-        f.write(fmt_1d(state["transformer.h.0.ln_1.weight"], "layer0_ln1_gamma"))
-        f.write(fmt_1d(state["transformer.h.0.ln_1.bias"], "layer0_ln1_beta"))
-        f.write(fmt_2d(state["transformer.h.0.attn.c_attn.weight"], "layer0_qkv_weight"))
-        f.write(fmt_1d(state["transformer.h.0.attn.c_attn.bias"], "layer0_qkv_bias"))
-        f.write(fmt_2d(state["transformer.h.0.attn.c_proj.weight"], "layer0_proj_weight"))
-        f.write(fmt_1d(state["transformer.h.0.attn.c_proj.bias"], "layer0_proj_bias"))
-
-        f.write(fmt_1d(state["transformer.h.0.ln_2.weight"], "layer0_ln2_gamma"))
-        f.write(fmt_1d(state["transformer.h.0.ln_2.bias"], "layer0_ln2_beta"))
-        f.write(fmt_2d(state["transformer.h.0.mlp.c_fc.weight"], "layer0_fc1_weight"))
-        f.write(fmt_1d(state["transformer.h.0.mlp.c_fc.bias"], "layer0_fc1_bias"))
-        f.write(fmt_2d(state["transformer.h.0.mlp.c_proj.weight"], "layer0_fc2_weight"))
-        f.write(fmt_1d(state["transformer.h.0.mlp.c_proj.bias"], "layer0_fc2_bias"))
-
-        # Final LN & LM Head
-        f.write(fmt_1d(state["transformer.ln_f.weight"], "ln_f_gamma"))
-        f.write(fmt_1d(state["transformer.ln_f.bias"], "ln_f_beta"))
-        f.write(fmt_2d(state["lm_head.weight"], "lm_head_weight"))
-        f.write(fmt_1d(state["lm_head.bias"], "lm_head_bias"))
-
-        f.write("#endif // MODEL_WEIGHTS_H\n")
-    print(f"\n[+] Exported weights successfully to {out_path}!")
+def export(model, directory):
+    directory = Path(directory)
+    state = model.cpu().state_dict()
+    cfg = model.config
+    count = sum(p.numel() for p in model.parameters())
+    (directory / 'model_config.h').write_text(
+        '#ifndef MODEL_CONFIG_H\n#define MODEL_CONFIG_H\n' +
+        f'#define VOCAB_SIZE 65\n#define BLOCK_SIZE {cfg["context"]}\n#define N_EMBD {cfg["width"]}\n'
+        f'#define N_HEAD {cfg["heads"]}\n#define N_LAYER {cfg["layers"]}\n#define MODEL_PARAMETERS {count}\n#endif\n')
+    arrays = {name: state[key] for name, key in OTHER_TENSORS.items()}
+    for name, key in LAYER_TENSORS.items():
+        arrays['layer_' + name] = torch.stack([state[f'transformer.h.{i}.{key}'] for i in range(cfg['layers'])])
+    with (directory / 'model_weights.h').open('w') as f:
+        f.write('// Trained weights; generated by train_micro_gpt.py. Do not edit.\n#ifndef MODEL_WEIGHTS_H\n#define MODEL_WEIGHTS_H\n')
+        for name, tensor in arrays.items():
+            values = tensor.numpy().flatten()
+            f.write(f'static const float {name}[{len(values)}] = {{\n')
+            for offset in range(0, len(values), 8):
+                f.write(', '.join(f'{float(v):.9e}f' for v in values[offset:offset+8]) + ',\n')
+            f.write('};\n')
+        f.write('#endif\n')
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=1000, help="Training steps")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--data", type=str, default="", help="Path to text data file")
-    args = parser.parse_args()
-
-    # Load training text
-    if args.data and os.path.exists(args.data):
-        with open(args.data, "r", encoding="utf-8") as f:
-            text = f.read()
-    else:
-        cache_file = "tinyshakespeare.txt"
-        if not os.path.exists(cache_file):
-            print("Downloading Tiny Shakespeare dataset...")
-            url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-            urllib.request.urlretrieve(url, cache_file)
-        with open(cache_file, "r", encoding="utf-8") as f:
-            text = f.read()
-
-    print(f"Dataset length: {len(text):,} characters")
-
-    # Filter text to supported vocabulary
-    encoded = [char_to_id[c] for c in text if c in char_to_id]
-    data = torch.tensor(encoded, dtype=torch.long)
-    n = int(0.9 * len(data))
-    train_data = data[:n]
-    val_data = data[n:]
-
-    def get_batch(split):
-        d = train_data if split == "train" else val_data
-        ix = torch.randint(len(d) - BLOCK_SIZE, (args.batch_size,))
-        x = torch.stack([d[i:i+BLOCK_SIZE] for i in ix])
-        y = torch.stack([d[i+1:i+BLOCK_SIZE+1] for i in ix])
-        return x, y
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Training on device: {device}")
-
-    model = MicroGPT().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-
-    param_count = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {param_count:,} (~{param_count * 4 / 1024:.1f} KB in float32)")
-
-    print("\nStarting training...")
+    p = argparse.ArgumentParser()
+    p.add_argument('--steps', type=int, default=4000)
+    p.add_argument('--batch-size', type=int, default=32)
+    p.add_argument('--device', choices=['cpu', 'mps', 'cuda'], default='cpu')
+    p.add_argument('--baseline', default='artifacts/baseline_weights.h')
+    p.add_argument('--lr', type=float, default=0.003)
+    args = p.parse_args()
+    torch.set_num_threads(4)
+    torch.manual_seed(42); random.seed(42); np.random.seed(42)
+    root = Path(__file__).resolve().parent
+    output = root / 'artifacts'; output.mkdir(exist_ok=True)
+    raw = (root / 'tinyshakespeare.txt').read_bytes()
+    text = raw.decode()
+    data = torch.tensor([VOCABULARY.index(c) for c in text], dtype=torch.long)
+    train, val, test = data[:int(len(data)*.9)], data[int(len(data)*.9):int(len(data)*.95)], data[int(len(data)*.95):]
+    gen = torch.Generator().manual_seed(123)
+    val_starts = torch.randint(64, len(val), (1024,), generator=gen)
+    test_starts = torch.randint(64, len(test), (2048,), generator=gen)
+    baseline = load_old_header(args.baseline).to(args.device)
+    baseline_loss = evaluate(baseline, test, args.device, test_starts)
+    print(f'Baseline test loss: {baseline_loss:.5f}', flush=True)
+    del baseline
+    model = MicroGPT().to(args.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
+    best = float('inf'); history = []; start = time.monotonic()
     for step in range(args.steps):
-        xb, yb = get_batch("train")
-        xb, yb = xb.to(device), yb.to(device)
-
-        logits, loss = model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        model.train()
+        positions = torch.randint(0, len(train)-65, (args.batch_size,))
+        indices = positions[:, None] + torch.arange(64)[None, :]
+        x = train[indices].to(args.device); y = train[indices+1].to(args.device)
+        warmup = min(1.0, (step+1)/100)
+        lr = args.lr * warmup * (.1 + .9 * .5 * (1 + math.cos(math.pi*step/args.steps)))
+        for group in optimizer.param_groups: group['lr'] = lr
+        loss = F.cross_entropy(model(x).reshape(-1,65), y.reshape(-1))
+        optimizer.zero_grad(set_to_none=True); loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if (step+1) % 250 == 0 or step == 0 or step+1 == args.steps:
+            score = evaluate(model, val, args.device, val_starts)
+            record = dict(step=step+1, train_loss=loss.item(), val_loss=score, elapsed_s=time.monotonic()-start)
+            history.append(record); print(json.dumps(record), flush=True)
+            if score < best:
+                best = score
+                torch.save(dict(config=model.config, state={k:v.detach().cpu() for k,v in model.state_dict().items()}, step=step+1), output/'best.pt')
+    checkpoint = torch.load(output/'best.pt', weights_only=True)
+    model.load_state_dict(checkpoint['state']); model.eval()
+    score = evaluate(model, test, args.device, test_starts)
+    torch.manual_seed(123)
+    samples = [sample(model, prompt) for prompt in ['ROMEO:\n', 'First Citizen:\n', 'To be or ']]
+    report = dict(seed=42, dataset_sha256=hashlib.sha256(raw).hexdigest(), split='90% train / 5% validation / 5% test',
+        parameters=sum(p.numel() for p in model.parameters()), config=model.config, device=args.device,
+        baseline_test_loss=baseline_loss, upgraded_test_loss=score, baseline_perplexity=math.exp(baseline_loss),
+        upgraded_perplexity=math.exp(score), selected_step=checkpoint['step'], history=history, samples=samples,
+        test_note='2048 identical fixed next-character targets; baseline context 32, upgraded context 64. Baseline training provenance unavailable.')
+    (root/'training_report.json').write_text(json.dumps(report, indent=2)+'\n')
+    print(json.dumps({k:v for k,v in report.items() if k != 'history'}, indent=2), flush=True)
+    if score >= baseline_loss:
+        raise RuntimeError('Candidate did not improve test loss; weights not exported')
+    export(model, root/'main')
 
-        if (step + 1) % 100 == 0 or step == 0:
-            print(f"Step {step+1:4d}/{args.steps:4d} | Loss: {loss.item():.4f}", flush=True)
-
-    # Preview generation
-    print("\n--- Model Output Preview ---")
-    start_context = torch.tensor([[char_to_id.get(c, 0) for c in "First Citizen:\n"]], dtype=torch.long, device=device)
-    generated = model.generate(start_context, max_new_tokens=100)
-    gen_text = "".join([id_to_char[i] for i in generated[0].tolist()])
-    print(gen_text)
-    print("----------------------------")
-
-    # Export to C header
-    export_to_c_header(model, "main/model_weights.h")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__': main()

@@ -71,3 +71,6 @@ Testing/
 sdkconfig.old
 .DS_Store
 __pycache__/
+
+.venv/
+artifacts/

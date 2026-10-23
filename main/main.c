@@ -3,12 +3,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "micro_gpt.h"
-#include "wifi_server.h"
 
-#define MAX_PROMPT_LEN 64
-#define MAX_GEN_TOKENS 50
-#define SAMPLING_TEMPERATURE 0.50f
+#define MAX_PROMPT_LEN BLOCK_SIZE
+#define MAX_GEN_TOKENS 128
+#define SAMPLING_TEMPERATURE 0.80f
+#define SAMPLING_TOP_K 20
 
 void app_main(void)
 {
@@ -16,16 +17,12 @@ void app_main(void)
 
     printf("\n");
     printf("========================================================\n");
-    printf("     ESP32-C3 Edge AI: Micro-Transformer Online!       \n");
+    printf("     ESP32-S3 Edge AI: Micro-Transformer Online!       \n");
     printf("  Architecture: %d Heads | %d Embd | %d Context Window  \n", N_HEAD, N_EMBD, BLOCK_SIZE);
-    printf("  Weights: Shakespeare (18,017 params in Flash)        \n");
+    printf("  Weights: Shakespeare (%d params, %d layers)\n", MODEL_PARAMETERS, N_LAYER);
     printf("========================================================\n");
 
-    // Start Wi-Fi SoftAP ("ESP32-Edge-AI") and Web Server (http://192.168.4.1)
-    wifi_server_init();
-
-    printf("\n[Wi-Fi Web UI Ready] Connect to 'ESP32-Edge-AI' -> Open http://192.168.4.1\n");
-    printf("[UART Ready] You can also type a prompt here and press Enter:\n\n> ");
+    printf("[USB Serial Ready] Type a prompt and press Enter:\n\n> ");
     fflush(stdout);
 
     char prompt[MAX_PROMPT_LEN + 1];
@@ -44,18 +41,21 @@ void app_main(void)
 
                     // 1. Tokenize prompt
                     int num_tokens = 0;
+                    int unsupported = 0;
                     printf("[2] Prompt Tokens: ");
                     for (int i = 0; i < prompt_len; i++) {
                         int id = micro_gpt_tokenize(prompt[i]);
                         if (id >= 0) {
                             token_history[num_tokens++] = id;
                             printf("%d ", id);
+                        } else {
+                            unsupported = 1;
                         }
                     }
                     printf("\n");
 
-                    if (num_tokens == 0) {
-                        printf("No valid vocabulary characters found.\n> ");
+                    if (unsupported || num_tokens == 0) {
+                        printf("Prompt contains unsupported characters; use the Shakespeare vocabulary.\n> ");
                         prompt_len = 0;
                         fflush(stdout);
                         continue;
@@ -67,9 +67,7 @@ void app_main(void)
                     printf("%s", prompt);
                     fflush(stdout);
 
-                    // Thread-safety with Web UI
-                    micro_gpt_lock();
-
+                    micro_gpt_init();
                     int64_t start_time = esp_timer_get_time();
                     int generated_count = 0;
 
@@ -78,9 +76,9 @@ void app_main(void)
                         const int *ctx_tokens = &token_history[num_tokens - ctx_len];
 
                         micro_gpt_forward(ctx_tokens, ctx_len, logits);
-                        micro_gpt_apply_repetition_penalty(logits, ctx_tokens, ctx_len, 1.25f);
 
-                        int next_tok = micro_gpt_sample(logits, SAMPLING_TEMPERATURE);
+                        float random_unit = (esp_random() >> 8) * (1.0f / 16777216.0f);
+                        int next_tok = micro_gpt_sample(logits, SAMPLING_TEMPERATURE, SAMPLING_TOP_K, random_unit);
                         char out_char = micro_gpt_detokenize(next_tok);
                         putchar(out_char);
                         fflush(stdout);
@@ -93,12 +91,8 @@ void app_main(void)
                         }
                         generated_count++;
 
-                        if ((step % 8) == 0) {
-                            vTaskDelay(1);
-                        }
+                        vTaskDelay(1);
                     }
-
-                    micro_gpt_unlock();
 
                     int64_t end_time = esp_timer_get_time();
                     float elapsed_ms = (float)(end_time - start_time) / 1000.0f;

@@ -1,289 +1,123 @@
 #include "micro_gpt.h"
 #include "model_weights.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <math.h>
-#include "esp_random.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include <string.h>
 
-// 65-character Tiny Shakespeare vocabulary
-const char VOCABULARY[] =
-    "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const char VOCABULARY[] = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-// Static activation buffers (allocated in BSS, consumes ~18 KB of RAM)
-static float s_x[BLOCK_SIZE * N_EMBD];
-static float s_x_ln1[BLOCK_SIZE * N_EMBD];
-static float s_K[BLOCK_SIZE * N_EMBD];
-static float s_V[BLOCK_SIZE * N_EMBD];
-static float s_Q[N_EMBD];
-static float s_attn_concat[N_EMBD];
-static float s_attn_proj[N_EMBD];
-static float s_scores[BLOCK_SIZE];
-static float s_x_ln2[N_EMBD];
-static float s_hidden[4 * N_EMBD];
-static float s_mlp_out[N_EMBD];
-static float s_x_final[N_EMBD];
+/* Each layer keeps keys and values for the current absolute-position window. */
+static float keys[N_LAYER][BLOCK_SIZE][N_EMBD];
+static float values[N_LAYER][BLOCK_SIZE][N_EMBD];
+static int cached_tokens[BLOCK_SIZE];
+static int cached_count;
+static float x[N_EMBD], norm[N_EMBD], qkv[3 * N_EMBD];
+static float attention[N_EMBD], projected[N_EMBD], hidden[4 * N_EMBD];
+static float scores[BLOCK_SIZE];
 
-static SemaphoreHandle_t s_gpt_mutex = NULL;
-
-void micro_gpt_init(void)
-{
-    memset(s_x, 0, sizeof(s_x));
-    if (s_gpt_mutex == NULL) {
-        s_gpt_mutex = xSemaphoreCreateMutex();
-    }
-}
-
-void micro_gpt_lock(void)
-{
-    if (s_gpt_mutex) {
-        xSemaphoreTake(s_gpt_mutex, portMAX_DELAY);
-    }
-}
-
-void micro_gpt_unlock(void)
-{
-    if (s_gpt_mutex) {
-        xSemaphoreGive(s_gpt_mutex);
-    }
-}
+void micro_gpt_init(void) { cached_count = 0; }
 
 int micro_gpt_tokenize(char c)
 {
-    for (int i = 0; i < VOCAB_SIZE; i++) {
-        if (VOCABULARY[i] == c) {
-            return i;
-        }
-    }
+    for (int i = 0; i < VOCAB_SIZE; i++) if (VOCABULARY[i] == c) return i;
     return -1;
 }
 
-char micro_gpt_detokenize(int token_id)
+char micro_gpt_detokenize(int token)
 {
-    if (token_id >= 0 && token_id < VOCAB_SIZE) {
-        return VOCABULARY[token_id];
-    }
-    return '?';
+    return token >= 0 && token < VOCAB_SIZE ? VOCABULARY[token] : '?';
 }
 
-static inline float gelu(float x)
+static void matvec(float *out, const float *in, const float *weight,
+                   const float *bias, int inputs, int outputs)
 {
-    return 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
-}
-
-static void layernorm(float *out, const float *in, const float *gamma, const float *beta, int dim)
-{
-    float mean = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        mean += in[i];
-    }
-    mean /= (float)dim;
-
-    float var = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        float diff = in[i] - mean;
-        var += diff * diff;
-    }
-    var /= (float)dim;
-
-    float inv_std = 1.0f / sqrtf(var + 1e-5f);
-    for (int i = 0; i < dim; i++) {
-        out[i] = (in[i] - mean) * inv_std * gamma[i] + beta[i];
+    for (int row = 0; row < outputs; row++) {
+        float sum = bias[row];
+        for (int col = 0; col < inputs; col++) sum += weight[row * inputs + col] * in[col];
+        out[row] = sum;
     }
 }
 
-// Matrix-vector multiplication: out = bias + weight * in
-// weight shape: [out_dim, in_dim]
-static void matvec(float *out, const float *in, const float *weight, const float *bias, int in_dim, int out_dim)
+static void layernorm(float *out, const float *in, const float *gamma, const float *beta)
 {
-    for (int j = 0; j < out_dim; j++) {
-        float acc = (bias != NULL) ? bias[j] : 0.0f;
-        const float *w_row = &weight[j * in_dim];
-        for (int i = 0; i < in_dim; i++) {
-            acc += in[i] * w_row[i];
-        }
-        out[j] = acc;
-    }
+    float mean = 0, variance = 0;
+    for (int i = 0; i < N_EMBD; i++) mean += in[i];
+    mean /= N_EMBD;
+    for (int i = 0; i < N_EMBD; i++) { float d = in[i] - mean; variance += d*d; }
+    float scale = 1.0f / sqrtf(variance / N_EMBD + 1e-5f);
+    for (int i = 0; i < N_EMBD; i++) out[i] = (in[i] - mean) * scale * gamma[i] + beta[i];
 }
 
-void micro_gpt_forward(const int *tokens, int seq_len, float *logits_out)
+void micro_gpt_forward(const int *tokens, int count, float *logits)
 {
-    if (seq_len <= 0) return;
-    if (seq_len > BLOCK_SIZE) seq_len = BLOCK_SIZE;
-
-    int last_idx = seq_len - 1;
-
-    // 1. Embeddings: wte (token) + wpe (position) for all tokens in context
-    for (int t = 0; t < seq_len; t++) {
-        int tok = tokens[t];
-        if (tok < 0 || tok >= VOCAB_SIZE) tok = 0;
-        
-        const float *tok_emb = &wte_weight[tok * N_EMBD];
-        const float *pos_emb = &wpe_weight[t * N_EMBD];
-        float *x_t = &s_x[t * N_EMBD];
-
-        for (int i = 0; i < N_EMBD; i++) {
-            x_t[i] = tok_emb[i] + pos_emb[i];
-        }
-    }
-
-    // 2. Transformer Layer 0
-    // 2a. Pre-LayerNorm on all tokens in context
-    for (int t = 0; t < seq_len; t++) {
-        layernorm(&s_x_ln1[t * N_EMBD], &s_x[t * N_EMBD], layer0_ln1_gamma, layer0_ln1_beta, N_EMBD);
-    }
-
-    // 2b. Compute K and V for all t in [0, seq_len - 1]
-    // qkv_weight layout: Q = rows [0..31], K = rows [32..63], V = rows [64..95]
-    for (int t = 0; t < seq_len; t++) {
-        const float *in_t = &s_x_ln1[t * N_EMBD];
-        float *k_t = &s_K[t * N_EMBD];
-        float *v_t = &s_V[t * N_EMBD];
-
-        // K projection
-        matvec(k_t, in_t, &layer0_qkv_weight[N_EMBD * N_EMBD], &layer0_qkv_bias[N_EMBD], N_EMBD, N_EMBD);
-        // V projection
-        matvec(v_t, in_t, &layer0_qkv_weight[2 * N_EMBD * N_EMBD], &layer0_qkv_bias[2 * N_EMBD], N_EMBD, N_EMBD);
-    }
-
-    // Compute Q for the last token only (position last_idx)
-    matvec(s_Q, &s_x_ln1[last_idx * N_EMBD], layer0_qkv_weight, layer0_qkv_bias, N_EMBD, N_EMBD);
-
-    // 2c. Multi-Head Attention for last token
-    float scale = 1.0f / sqrtf((float)HEAD_DIM);
-
-    for (int h = 0; h < N_HEAD; h++) {
-        int h_offset = h * HEAD_DIM;
-        const float *q_h = &s_Q[h_offset];
-
-        // Dot-product Q with past K
-        float max_score = -1e9f;
-        for (int t = 0; t < seq_len; t++) {
-            const float *k_h = &s_K[t * N_EMBD + h_offset];
-            float dot = 0.0f;
-            for (int d = 0; d < HEAD_DIM; d++) {
-                dot += q_h[d] * k_h[d];
+    /* Caller supplies 1..BLOCK_SIZE valid token IDs. Cache only identical prefixes.
+       A shifted window changes learned position embeddings, so it is rebuilt. */
+    int start = 0;
+    while (start < count && start < cached_count && tokens[start] == cached_tokens[start]) start++;
+    if (start == count) start--; /* Recreate the final hidden state for repeat calls. */
+    for (int position = start; position < count; position++) {
+        for (int d = 0; d < N_EMBD; d++)
+            x[d] = wte_weight[tokens[position] * N_EMBD + d] + wpe_weight[position * N_EMBD + d];
+        for (int layer = 0; layer < N_LAYER; layer++) {
+            const int vector = layer * N_EMBD;
+            const int matrix = layer * N_EMBD * N_EMBD;
+            layernorm(norm, x, layer_ln1_gamma + vector, layer_ln1_beta + vector);
+            matvec(qkv, norm, layer_qkv_weight + 3 * matrix, layer_qkv_bias + 3 * vector, N_EMBD, 3*N_EMBD);
+            memcpy(keys[layer][position], qkv + N_EMBD, sizeof(float)*N_EMBD);
+            memcpy(values[layer][position], qkv + 2*N_EMBD, sizeof(float)*N_EMBD);
+            for (int head = 0; head < N_HEAD; head++) {
+                int offset = head * HEAD_DIM;
+                float maximum = -INFINITY;
+                for (int t = 0; t <= position; t++) {
+                    float dot = 0;
+                    for (int d = 0; d < HEAD_DIM; d++) dot += qkv[offset+d] * keys[layer][t][offset+d];
+                    scores[t] = dot / sqrtf((float)HEAD_DIM);
+                    if (scores[t] > maximum) maximum = scores[t];
+                }
+                float sum = 0;
+                for (int t = 0; t <= position; t++) { scores[t] = expf(scores[t]-maximum); sum += scores[t]; }
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    float weighted = 0;
+                    for (int t = 0; t <= position; t++) weighted += scores[t] * values[layer][t][offset+d];
+                    attention[offset+d] = weighted / sum;
+                }
             }
-            float sc = dot * scale;
-            s_scores[t] = sc;
-            if (sc > max_score) max_score = sc;
-        }
-
-        // Softmax
-        float sum_exp = 0.0f;
-        for (int t = 0; t < seq_len; t++) {
-            s_scores[t] = expf(s_scores[t] - max_score);
-            sum_exp += s_scores[t];
-        }
-        float inv_sum = 1.0f / (sum_exp + 1e-8f);
-        for (int t = 0; t < seq_len; t++) {
-            s_scores[t] *= inv_sum;
-        }
-
-        // Weighted sum of V
-        float *out_h = &s_attn_concat[h_offset];
-        for (int d = 0; d < HEAD_DIM; d++) {
-            float v_acc = 0.0f;
-            for (int t = 0; t < seq_len; t++) {
-                v_acc += s_scores[t] * s_V[t * N_EMBD + h_offset + d];
+            matvec(projected, attention, layer_proj_weight + matrix, layer_proj_bias + vector, N_EMBD, N_EMBD);
+            for (int d = 0; d < N_EMBD; d++) x[d] += projected[d];
+            layernorm(norm, x, layer_ln2_gamma + vector, layer_ln2_beta + vector);
+            matvec(hidden, norm, layer_fc1_weight + 4*matrix, layer_fc1_bias + 4*vector, N_EMBD, 4*N_EMBD);
+            for (int d = 0; d < 4*N_EMBD; d++) {
+                float a = hidden[d];
+                hidden[d] = 0.5f*a*(1.0f+tanhf(0.7978845608f*(a+0.044715f*a*a*a)));
             }
-            out_h[d] = v_acc;
+            matvec(projected, hidden, layer_fc2_weight + 4*matrix, layer_fc2_bias + vector, 4*N_EMBD, N_EMBD);
+            for (int d = 0; d < N_EMBD; d++) x[d] += projected[d];
         }
+        cached_tokens[position] = tokens[position];
     }
-
-    // 2d. Output projection
-    matvec(s_attn_proj, s_attn_concat, layer0_proj_weight, layer0_proj_bias, N_EMBD, N_EMBD);
-
-    // Residual add to last position of x
-    float *x_last = &s_x[last_idx * N_EMBD];
-    for (int i = 0; i < N_EMBD; i++) {
-        x_last[i] += s_attn_proj[i];
-    }
-
-    // 2e. Pre-LayerNorm 2
-    layernorm(s_x_ln2, x_last, layer0_ln2_gamma, layer0_ln2_beta, N_EMBD);
-
-    // 2f. Feed-Forward MLP: fc1 (32 -> 128) + GELU
-    matvec(s_hidden, s_x_ln2, layer0_fc1_weight, layer0_fc1_bias, N_EMBD, 4 * N_EMBD);
-    for (int i = 0; i < 4 * N_EMBD; i++) {
-        s_hidden[i] = gelu(s_hidden[i]);
-    }
-
-    // fc2 (128 -> 32)
-    matvec(s_mlp_out, s_hidden, layer0_fc2_weight, layer0_fc2_bias, 4 * N_EMBD, N_EMBD);
-
-    // Residual add
-    for (int i = 0; i < N_EMBD; i++) {
-        x_last[i] += s_mlp_out[i];
-    }
-
-    // 3. Final LayerNorm
-    layernorm(s_x_final, x_last, ln_f_gamma, ln_f_beta, N_EMBD);
-
-    // 4. LM Head: project to VOCAB_SIZE logits
-    matvec(logits_out, s_x_final, lm_head_weight, lm_head_bias, N_EMBD, VOCAB_SIZE);
+    cached_count = count;
+    layernorm(norm, x, ln_f_gamma, ln_f_beta);
+    matvec(logits, norm, lm_head_weight, lm_head_bias, N_EMBD, VOCAB_SIZE);
 }
 
-void micro_gpt_apply_repetition_penalty(float *logits, const int *tokens, int seq_len, float penalty)
+int micro_gpt_sample(const float *logits, float temperature, int top_k, float random_unit)
 {
-    if (penalty <= 1.0f || seq_len <= 0) return;
-
-    // Look back up to the last 16 tokens in context
-    int start = (seq_len > 16) ? (seq_len - 16) : 0;
-    for (int i = start; i < seq_len; i++) {
-        int tok = tokens[i];
-        if (tok >= 0 && tok < VOCAB_SIZE) {
-            // Keskar et al. repetition penalty formula
-            if (logits[tok] > 0.0f) {
-                logits[tok] /= penalty;
-            } else {
-                logits[tok] *= penalty;
-            }
-        }
-    }
-}
-
-int micro_gpt_sample(float *logits, float temperature)
-{
-    // Greedy argmax if temperature is tiny
-    if (temperature <= 0.01f) {
-        int best_id = 0;
-        float best_val = logits[0];
-        for (int i = 1; i < VOCAB_SIZE; i++) {
-            if (logits[i] > best_val) {
-                best_val = logits[i];
-                best_id = i;
-            }
-        }
-        return best_id;
-    }
-
-    // Temperature scaling & max subtraction for stability
-    float max_logit = -1e9f;
+    int order[VOCAB_SIZE];
     for (int i = 0; i < VOCAB_SIZE; i++) {
-        logits[i] /= temperature;
-        if (logits[i] > max_logit) max_logit = logits[i];
+        int j = i;
+        while (j > 0 && logits[order[j-1]] < logits[i]) { order[j] = order[j-1]; j--; }
+        order[j] = i;
     }
-
-    float sum_exp = 0.0f;
-    for (int i = 0; i < VOCAB_SIZE; i++) {
-        logits[i] = expf(logits[i] - max_logit);
-        sum_exp += logits[i];
+    if (temperature <= 0.01f) return order[0];
+    if (top_k <= 0 || top_k > VOCAB_SIZE) top_k = VOCAB_SIZE;
+    float probabilities[VOCAB_SIZE], total = 0;
+    for (int i = 0; i < top_k; i++) {
+        probabilities[i] = expf((logits[order[i]]-logits[order[0]])/temperature);
+        total += probabilities[i];
     }
-
-    // ESP32 hardware true random float in [0, 1)
-    uint32_t rand_val = esp_random();
-    float r = (float)rand_val / 4294967296.0f;
-
-    float cdf = 0.0f;
-    for (int i = 0; i < VOCAB_SIZE; i++) {
-        cdf += logits[i] / sum_exp;
-        if (r <= cdf) {
-            return i;
-        }
+    float threshold = random_unit * total, cumulative = 0;
+    for (int i = 0; i < top_k; i++) {
+        cumulative += probabilities[i];
+        if (threshold < cumulative) return order[i];
     }
-
-    return VOCAB_SIZE - 1;
+    return order[top_k-1];
 }
